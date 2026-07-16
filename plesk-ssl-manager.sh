@@ -8,6 +8,13 @@ REGISTRATION_EMAIL="admin@tuodominio.com"
 LOG_FILE="/var/log/plesk_ssl_auto_update.log"
 EXPIRY_THRESHOLD_DAYS=30  # Renew only if certificate expires in less than X days
 
+# --- WEBHOOK CONFIGURATION ---
+# Set to "telegram" or "slack" and fill the variables to receive instant alerts.
+WEBHOOK_PROVIDER="" # "telegram" or "slack" or "" (disabled)
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+SLACK_WEBHOOK_URL=""
+
 # Define ANSI color codes (only used if stdout is a TTY)
 if [ -t 1 ]; then
     RED='\033[1;31m'
@@ -21,13 +28,27 @@ else
     NC=''
 fi
 
+DRY_RUN=0
+
 # Ensure running as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: This script must be run as root." >&2
     exit 1
 fi
 
-# --- SMART LOGGING HELPERS (Keeps log files clean of ANSI escape codes) ---
+# --- SMART LOGGING & NOTIFICATIONS HELPERS ---
+send_webhook() {
+    [ -z "$WEBHOOK_PROVIDER" ] && return
+    message="[SSL MANAGER] $1"
+    if [ "$WEBHOOK_PROVIDER" = "telegram" ] && [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -d "chat_id=$TELEGRAM_CHAT_ID" -d "text=$message" >/dev/null 2>&1
+    elif [ "$WEBHOOK_PROVIDER" = "slack" ] && [ -n "$SLACK_WEBHOOK_URL" ]; then
+        payload="{\"text\": \"$(echo "$message" | sed 's/"/\\"/g')\"}"
+        curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null 2>&1
+    fi
+}
+
 log_info() {
     echo "INFO: $1" >> "$LOG_FILE"
     echo "INFO: $1"
@@ -51,6 +72,7 @@ log_skipped() {
 log_error() {
     echo "ERROR: $1" >> "$LOG_FILE"
     printf "${RED}ERROR:${NC} %s\n" "$1"
+    send_webhook "❌ Error: $1"
 }
 
 # Retrieve all configured IPs from Plesk DB
@@ -79,7 +101,7 @@ resolve_dns() {
     echo "$resolved_ip" | tr -d '\r\n '
 }
 
-# Calculate day difference between expiry date (YYYY-MM-DD) and today
+# Calculate day difference between expiry date and today
 get_days_diff() {
     target_date="$1"
     target_clean=$(echo "$target_date" | cut -d' ' -f1)
@@ -96,13 +118,13 @@ get_days_diff() {
 get_cert_expiry() {
     domain_name="$1"
     cert_file=$(plesk db -N -B -e "
-        SELECT c.cert_file
-        FROM domains d
-        JOIN hosting h ON d.id = h.dom_id
-        JOIN certificates c ON h.certificate_id = c.id
+        SELECT c.cert_file 
+        FROM domains d 
+        JOIN hosting h ON d.id = h.dom_id 
+        JOIN certificates c ON h.certificate_id = c.id 
         WHERE d.name='$domain_name'
     " 2>/dev/null | tr -d '\r\n ')
-
+    
     if [ -n "$cert_file" ] && [ "$cert_file" != "NULL" ]; then
         cert_path="/usr/local/psa/var/certificates/$cert_file"
         if [ -f "$cert_path" ]; then
@@ -114,6 +136,23 @@ get_cert_expiry() {
         fi
     fi
     echo "N/D"
+}
+
+# --- PRE-FLIGHT DIRECTORY REPAIR ---
+# Bypass local Plesk filemng permission crashes on standard renewals
+repair_challenge_dir() {
+    domain="$1"
+    # Query system user for the domain
+    sys_user=$(plesk db -N -B -e "SELECT login FROM sys_users WHERE id=(SELECT sys_user_id FROM hosting WHERE dom_id=(SELECT id FROM domains WHERE name='$domain'))" 2>/dev/null | tr -d '\r\n')
+    if [ -n "$sys_user" ]; then
+        doc_root="/var/www/vhosts/$domain"
+        [ -d "$doc_root" ] && {
+            mkdir -p "$doc_root/.well-known/acme-challenge"
+            chown -R "$sys_user:psacln" "$doc_root/.well-known"
+            chmod 755 "$doc_root/.well-known"
+            chmod 755 "$doc_root/.well-known/acme-challenge"
+        }
+    fi
 }
 
 # --- 1. GENERAL REPORT ---
@@ -142,7 +181,7 @@ print_report() {
                 if [ -n "$raw_expiry" ]; then
                     expiry=$(date -u -d "$raw_expiry" +"%Y-%m-%d" 2>/dev/null)
                     days=$(get_days_diff "$expiry")
-
+                    
                     if [ "$days" = "N/D" ]; then
                         status_str="DATE PARSING ERROR"
                         printf "%-40s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_name" "$expiry" "$status_str"
@@ -173,10 +212,10 @@ check_dns_orphans() {
     printf "\n=== DNS DIAGNOSTICS: ORPHANED/MIGRATED DOMAINS ===\n"
     printf "%-45s %-18s %-30s\n" "DOMAIN" "RESOLVED DNS IP" "SERVER DEPLOYMENT STATUS"
     printf "%s\n" "-------------------------------------------------------------------------------------------------------"
-
+    
     local_ips=$(get_local_ips)
     domains=$(plesk db -N -B -e "SELECT d.name FROM domains d INNER JOIN hosting h ON d.id = h.dom_id")
-
+    
     for domain in $domains; do
         resolved_ip=$(resolve_dns "$domain")
         if [ -z "$resolved_ip" ]; then
@@ -192,19 +231,25 @@ check_dns_orphans() {
 run_update() {
     force_renew=0
     target_domain=""
+    wildcard_mode=0
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --force) force_renew=1 ;;
+            --wildcard) wildcard_mode=1 ;;
             *) target_domain="$1" ;;
         esac
         shift
     done
 
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_info "DRY-RUN MODE ACTIVE. No actual changes will be made."
+    fi
+
     echo "=== SSL Renewal Session Started: $(date) ===" >> "$LOG_FILE"
 
     local_ips=$(get_local_ips)
-    if [ -z "$local_ips" ]; then
+    if [ -z "$local_ips" ] && [ "$wildcard_mode" -eq 0 ]; then
         log_warn "Could not determine local IP addresses. Skipping DNS checks."
     fi
 
@@ -217,8 +262,8 @@ run_update() {
     fi
 
     for domain in $domains; do
-        # --- PRE-FLIGHT DNS CHECK ---
-        if [ -n "$local_ips" ]; then
+        # --- PRE-FLIGHT DNS CHECK (Skip if Wildcard is requested, as DNS check differs) ---
+        if [ -n "$local_ips" ] && [ "$wildcard_mode" -eq 0 ]; then
             resolved_ip=$(resolve_dns "$domain")
             if [ -z "$resolved_ip" ]; then
                 log_warn "DNS missing for '$domain'. Skipping."
@@ -241,11 +286,48 @@ run_update() {
             fi
         fi
 
-        log_info "Renewing SSL certificate for: $domain"
+        # --- REPAIR PERMISSIONS PRE-EMPTIVELY ---
+        if [ "$DRY_RUN" -eq 0 ] && [ "$wildcard_mode" -eq 0 ]; then
+            repair_challenge_dir "$domain"
+        fi
 
+        log_info "Renewing SSL certificate for: $domain (Wildcard: $wildcard_mode)"
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log_success "[DRY-RUN] Checked renewal logic successfully for $domain."
+            continue
+        fi
+
+        # --- PROCESS WILDCARD ISSUANCE (DNS CHALLENGE) ---
+        if [ "$wildcard_mode" -eq 1 ]; then
+            # Initiate SSL Wildcard issuance through plesk sslit
+            output=$(plesk ext sslit --certificate -issue -domain "$domain" -registrationEmail "$REGISTRATION_EMAIL" -secure-domain -wildcard 2>&1)
+            status=$?
+            
+            # Check if DNS TXT is required (external DNS)
+            if echo "$output" | grep -q "pending"; then
+                txt_host="_acme-challenge.$domain"
+                txt_value=$(echo "$output" | grep "dnsRecordValue" | cut -d':' -f2 | tr -d ' ')
+                
+                log_warn "External DNS detected for Wildcard '$domain'."
+                log_info "ACTION REQUIRED: Create TXT record on your DNS panel:"
+                log_info "  Host: $txt_host"
+                log_info "  Value: $txt_value"
+                
+                send_webhook "⚠️ DNS TXT Action Required for $domain:\nHost: $txt_host\nValue: $txt_value"
+                continue
+            elif [ $status -eq 0 ]; then
+                log_success "Wildcard SSL certificate for '$domain' updated successfully (Auto DNS)."
+            else
+                log_error "Failed to update Wildcard SSL certificate for '$domain'. Details:\n$output"
+            fi
+            continue
+        fi
+
+        # --- PROCESS STANDARD ISSUANCE (HTTP CHALLENGE) ---
         alias_list=$(plesk db -N -B -e "SELECT name FROM domain_aliases WHERE dom_id = (SELECT id FROM domains WHERE name='$domain')")
         domains_arg="-d $domain"
-
+        
         dots_count=$(echo "$domain" | tr -cd '.' | wc -c)
         if [ "$dots_count" -eq 1 ]; then
             domains_arg="$domains_arg -d www.$domain"
@@ -263,14 +345,15 @@ run_update() {
                 domains_arg="$domains_arg -d $alias -d www.$alias"
             fi
         done
-
+        
         cmd="plesk bin extension --exec letsencrypt cli.php -m \"$REGISTRATION_EMAIL\" $domains_arg --expand"
         output=$(eval "$cmd" 2>&1)
         status=$?
-
+        
         if [ $status -eq 0 ]; then
             new_expiry=$(get_cert_expiry "$domain")
             log_success "SSL certificate for '$domain' updated successfully. New expiry: $new_expiry"
+            send_webhook "✅ SSL Renewed: $domain (expires: $new_expiry)"
         else
             log_error "Failed to update SSL certificate for '$domain'.\n\nError details:\n$output"
         fi
@@ -279,6 +362,13 @@ run_update() {
 }
 
 # --- ARGUMENT ROUTER ---
+# Extract global --dry-run option if present
+for arg in "$@"; do
+    if [ "$arg" = "--dry-run" ]; then
+        DRY_RUN=1
+    fi
+done
+
 case "$1" in
     "")
         print_report
@@ -287,13 +377,16 @@ case "$1" in
         check_dns_orphans
         ;;
     --update)
-        if [ "$2" = "--force" ]; then
-            run_update --force "$3"
-        elif [ "$3" = "--force" ]; then
-            run_update --force "$2"
-        else
-            run_update "$2"
-        fi
+        # Shift past '--update' and filter out '--dry-run' for the renewal engine
+        shift
+        args_clean=""
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" != "--dry-run" ]; then
+                args_clean="$args_clean $1"
+            fi
+            shift
+        done
+        run_update $args_clean
         ;;
     *)
         echo "Usage: $0 [OPTION]"
@@ -302,7 +395,9 @@ case "$1" in
         echo "  --update                    Trigger smart renewal (only certificates expiring in < $EXPIRY_THRESHOLD_DAYS days)."
         echo "  --update <domain>           Renew only the specified domain/subdomain."
         echo "  --update --force            Force-renew all local domains immediately."
-        echo "  --update <domain> --force   Force-renew the specified domain immediately."
+        echo "  --update --wildcard         Request a wildcard certificate via DNS challenge."
+        echo "                              (If external DNS, returns the TXT record to apply)."
+        echo "  --dry-run                   Add to any --update command to simulate execution."
         exit 1
         ;;
 esac
