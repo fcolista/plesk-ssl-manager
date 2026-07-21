@@ -33,7 +33,7 @@ plesk bin settings --set restart_apache_gracefully=true
 
 2. **Download/Create the script file:**
 ```
-   nano /usr/local/bin/plesk-ssl-manager.sh
+nano /usr/local/bin/plesk-ssl-manager.sh
 ```
 Paste the script code and make it executable:
 ```
