@@ -9,7 +9,6 @@ LOG_FILE="/var/log/plesk_ssl_auto_update.log"
 EXPIRY_THRESHOLD_DAYS=30  # Renew only if certificate expires in less than X days
 
 # --- WEBHOOK CONFIGURATION ---
-# Set to "telegram" or "slack" and fill the variables to receive instant alerts.
 WEBHOOK_PROVIDER="" # "telegram" or "slack" or "" (disabled)
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
@@ -139,10 +138,8 @@ get_cert_expiry() {
 }
 
 # --- PRE-FLIGHT DIRECTORY REPAIR ---
-# Bypass local Plesk filemng permission crashes on standard renewals
 repair_challenge_dir() {
     domain="$1"
-    # Query system user for the domain
     sys_user=$(plesk db -N -B -e "SELECT login FROM sys_users WHERE id=(SELECT sys_user_id FROM hosting WHERE dom_id=(SELECT id FROM domains WHERE name='$domain'))" 2>/dev/null | tr -d '\r\n')
     if [ -n "$sys_user" ]; then
         doc_root="/var/www/vhosts/$domain"
@@ -153,6 +150,24 @@ repair_challenge_dir() {
             chmod 755 "$doc_root/.well-known/acme-challenge"
         }
     fi
+}
+
+# --- POST-RENEWAL WEB SERVER RELOAD ---
+reload_webservers() {
+    log_info "Reloading web servers to apply newly issued SSL certificates..."
+    
+    # Graceful reload for Apache via Plesk CLI
+    if command -v plesk >/dev/null 2>&1; then
+        plesk bin service --restart apache2 >/dev/null 2>&1 || \
+        plesk bin service --restart httpd >/dev/null 2>&1
+    fi
+
+    # Reload Nginx if active (Plesk often uses Nginx as reverse proxy)
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl reload nginx >/dev/null 2>&1
+    fi
+
+    log_success "Web servers reloaded successfully."
 }
 
 # --- 1. GENERAL REPORT ---
@@ -232,6 +247,7 @@ run_update() {
     force_renew=0
     target_domain=""
     wildcard_mode=0
+    renewed_any=0
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -262,7 +278,7 @@ run_update() {
     fi
 
     for domain in $domains; do
-        # --- PRE-FLIGHT DNS CHECK (Skip if Wildcard is requested, as DNS check differs) ---
+        # --- PRE-FLIGHT DNS CHECK ---
         if [ -n "$local_ips" ] && [ "$wildcard_mode" -eq 0 ]; then
             resolved_ip=$(resolve_dns "$domain")
             if [ -z "$resolved_ip" ]; then
@@ -300,11 +316,9 @@ run_update() {
 
         # --- PROCESS WILDCARD ISSUANCE (DNS CHALLENGE) ---
         if [ "$wildcard_mode" -eq 1 ]; then
-            # Initiate SSL Wildcard issuance through plesk sslit
             output=$(plesk ext sslit --certificate -issue -domain "$domain" -registrationEmail "$REGISTRATION_EMAIL" -secure-domain -wildcard 2>&1)
             status=$?
             
-            # Check if DNS TXT is required (external DNS)
             if echo "$output" | grep -q "pending"; then
                 txt_host="_acme-challenge.$domain"
                 txt_value=$(echo "$output" | grep "dnsRecordValue" | cut -d':' -f2 | tr -d ' ')
@@ -318,6 +332,7 @@ run_update() {
                 continue
             elif [ $status -eq 0 ]; then
                 log_success "Wildcard SSL certificate for '$domain' updated successfully (Auto DNS)."
+                renewed_any=1
             else
                 log_error "Failed to update Wildcard SSL certificate for '$domain'. Details:\n$output"
             fi
@@ -354,15 +369,21 @@ run_update() {
             new_expiry=$(get_cert_expiry "$domain")
             log_success "SSL certificate for '$domain' updated successfully. New expiry: $new_expiry"
             send_webhook "✅ SSL Renewed: $domain (expires: $new_expiry)"
+            renewed_any=1
         else
             log_error "Failed to update SSL certificate for '$domain'.\n\nError details:\n$output"
         fi
     done
+
+    # --- RELOAD WEBSERVERS IF ANY CERTIFICATE WAS RENEWED ---
+    if [ "$renewed_any" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        reload_webservers
+    fi
+
     echo "=== SSL Renewal Session Finished: $(date) ===" >> "$LOG_FILE"
 }
 
 # --- ARGUMENT ROUTER ---
-# Extract global --dry-run option if present
 for arg in "$@"; do
     if [ "$arg" = "--dry-run" ]; then
         DRY_RUN=1
@@ -377,7 +398,6 @@ case "$1" in
         check_dns_orphans
         ;;
     --update)
-        # Shift past '--update' and filter out '--dry-run' for the renewal engine
         shift
         args_clean=""
         while [ "$#" -gt 0 ]; do
