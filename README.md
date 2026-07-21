@@ -1,16 +1,21 @@
 # Plesk SSL Manager & Updater (Enterprise Edition)
 
-A lightweight, robust, and highly efficient **POSIX-compliant** shell script designed for Plesk administrators to automate, manage, and monitor Let's Encrypt SSL certificates across multi-IP server environments. 
+A lightweight, robust, and highly efficient POSIX-compliant shell script designed for Plesk administrators to automate, manage, and monitor Let's Encrypt SSL certificates across multi-IP server environments.
 
-By performing **pre-flight DNS checks**, this script prevents Let's Encrypt validation failures, avoids API rate limits, and stops useless error notification emails caused by migrated, orphaned, or misconfigured domains.
+By performing pre-flight DNS checks, this script prevents Let's Encrypt validation failures, avoids API rate limits, and stops useless error notification emails caused by migrated, orphaned, or misconfigured domains.
 
 ---
 
 ## Key Features
 
 * **POSIX Compliant:** Runs seamlessly on lightweight systems without bash-specific dependencies.
+* **External Configuration File:** Keeps secrets, API tokens, and admin emails separate from the code (/etc/plesk_ssl_manager.conf).
+* **Automatic Web Server Reload:** Automatically performs a graceful reload on Apache and Nginx immediately after renewing certificates so changes take effect without downtime.
 * **Smart Multi-IP Detection:** Queries Plesk's internal database to map all active IPv4 addresses, avoiding false negatives on multi-homed servers.
 * **Pre-flight DNS Verification:** Resolves domains over public DNS *before* requesting a renewal. If a domain has migrated to an external IP or lacks DNS records, it is safely skipped.
+* **Instant Alerts (Webhooks):** Native integration with Telegram and Slack webhooks for instant status and action alerts.
+* **Wildcard & DNS Challenge Support:** Capability to request Wildcard certificates (--wildcard) via Plesk SSL It! extension.
+* **Dry-Run Simulation:** Test logic and pre-flight checks without issuing actual ACME certificates.
 * **Smart Renewals:** Only triggers renewals for certificates expiring within a customizable window (default: 30 days) to keep resource usage minimal.
 * **Interactive Colorized Dashboard:** Displays a clear, color-coded terminal overview (`GREEN` for Active, `YELLOW` for Expiring Soon, `RED` for Expired/Not Protected).
 * **Orphan & Migration Diagnostics (`--check-dns`):** Instantly scans and lists virtual hosts that no longer point to your server, serving as an invaluable cleanup checklist.
@@ -20,7 +25,13 @@ By performing **pre-flight DNS checks**, this script prevents Let's Encrypt vali
 
 ## Installation
 
-1. **Download/Create the script file:**
+1. Enable Apache Graceful Restart in Plesk (One-time setup):
+
+```
+plesk bin settings --set restart_apache_gracefully=true
+```
+
+2. **Download/Create the script file:**
 ```
    nano /usr/local/bin/plesk-ssl-manager.sh
 ```
@@ -29,19 +40,54 @@ Paste the script code and make it executable:
 chmod +x /usr/local/bin/plesk-ssl-manager.sh
 ```
 
-Verify installation by running the script without arguments:
+3. **Create the Configuration File:**
+
+```
+nano /etc/plesk_ssl_manager.conf
+```
+_See the Configuration section below._
+
+4. **Verify installation:**
+
 ```
 /usr/local/bin/plesk-ssl-manager.sh
 ```
 
 ## Configuration
 
-Open the script and adjust the global variables at the top of the file to fit your server setup:
+Create `/etc/plesk_ssl_manager.conf` (or place `plesk_ssl_manager.conf` in the same directory as the script). 
+Set restrictive permissions to protect sensitive API tokens:
+
 ```
-NOTIFICATION_EMAIL="sysadmin@yourdomain.com" # Where to send success/error mail alerts
-REGISTRATION_EMAIL="admin@yourdomain.com"     # Email registered with Let's Encrypt
-LOG_FILE="/var/log/plesk_ssl_auto_update.log" # Log output destination
-EXPIRY_THRESHOLD_DAYS=30                      # Smart renewal threshold window
+chmod 600 /etc/plesk_ssl_manager.conf
+```
+
+## Configuration File Template (`/etc/plesk_ssl_manager.conf`)
+
+```
+# ==============================================================================
+# PLESK SSL MANAGER & UPDATER - CONFIGURATION FILE
+# ==============================================================================
+
+# Email for system alerts
+NOTIFICATION_EMAIL="sysadmin@yourdomain.com"
+
+# Email registered with Let's Encrypt / SSL It! account
+REGISTRATION_EMAIL="admin@yourdomain.com"
+
+# Renew certificate only if expiring in less than X days
+EXPIRY_THRESHOLD_DAYS=30
+
+# --- WEBHOOK NOTIFICATIONS ---
+# Options: "telegram", "slack", or "" (disabled)
+WEBHOOK_PROVIDER=""
+
+# Telegram Settings (required if WEBHOOK_PROVIDER="telegram")
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# Slack Settings (required if WEBHOOK_PROVIDER="slack")
+SLACK_WEBHOOK_URL=""
 ```
 
 ## Usage Guide
@@ -77,6 +123,20 @@ Override the 30-day smart check to force an immediate renewal of all domains, or
 ```
 /usr/local/bin/plesk-ssl-manager.sh --update --force
 /usr/local/bin/plesk-ssl-manager.sh --update example.com --force
+```
+
+6. Wildcard Issuance
+Request a Wildcard SSL certificate via DNS Challenge. If external DNS is detected, it returns the required ACME TXT record details (and sends a webhook notification):
+
+```
+/usr/local/bin/plesk-ssl-manager.sh --update example.com --wildcard
+```
+
+7. Simulation / Dry-Run Mode
+Simulate execution without issuing actual certificates or reloading web servers:
+
+```
+/usr/local/bin/plesk-ssl-manager.sh --update --dry-run
 ```
 
 ## Automation & Maintenance
@@ -116,6 +176,7 @@ Paste the following config:
 ## Requirements
 
 - Plesk Obsidian (with the official Let's Encrypt Extension installed)
-- bind-tools (dig) or dnsutils (host)
+- bind-tools (`dig`) or dnsutils (`host`)
 - openssl
+- curl
 - Root privileges
