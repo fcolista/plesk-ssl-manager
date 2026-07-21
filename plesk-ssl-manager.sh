@@ -3,16 +3,31 @@
 # PLESK SSL MANAGER & UPDATER - Enterprise Edition (POSIX Compliant)
 # ==============================================================================
 
-NOTIFICATION_EMAIL="sysadmin@tuodominio.com"
-REGISTRATION_EMAIL="admin@tuodominio.com"
-LOG_FILE="/var/log/plesk_ssl_auto_update.log"
-EXPIRY_THRESHOLD_DAYS=30  # Renew only if certificate expires in less than X days
+# --- CONFIGURATION RESOLUTION & LOADING ---
+# Search for configuration file in the script's directory first, then in /etc/
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+CONFIG_FILE=""
 
-# --- WEBHOOK CONFIGURATION ---
-WEBHOOK_PROVIDER="" # "telegram" or "slack" or "" (disabled)
-TELEGRAM_BOT_TOKEN=""
-TELEGRAM_CHAT_ID=""
-SLACK_WEBHOOK_URL=""
+if [ -f "$SCRIPT_DIR/plesk_ssl_manager.conf" ]; then
+    CONFIG_FILE="$SCRIPT_DIR/plesk_ssl_manager.conf"
+elif [ -f "/etc/plesk_ssl_manager.conf" ]; then
+    CONFIG_FILE="/etc/plesk_ssl_manager.conf"
+fi
+
+if [ -n "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+else
+    # Default fallback values if no configuration file is found
+    NOTIFICATION_EMAIL="admin@localhost"
+    REGISTRATION_EMAIL="admin@localhost"
+    EXPIRY_THRESHOLD_DAYS=30
+    WEBHOOK_PROVIDER=""
+    TELEGRAM_BOT_TOKEN=""
+    TELEGRAM_CHAT_ID=""
+    SLACK_WEBHOOK_URL=""
+fi
+
+LOG_FILE="/var/log/plesk_ssl_auto_update.log"
 
 # Define ANSI color codes (only used if stdout is a TTY)
 if [ -t 1 ]; then
@@ -263,6 +278,12 @@ run_update() {
     fi
 
     echo "=== SSL Renewal Session Started: $(date) ===" >> "$LOG_FILE"
+
+    if [ -n "$CONFIG_FILE" ]; then
+        log_info "Loaded configuration from: $CONFIG_FILE"
+    else
+        log_warn "No config file found (/etc/plesk_ssl_manager.conf or script dir). Using fallback defaults."
+    fi
 
     local_ips=$(get_local_ips)
     if [ -z "$local_ips" ] && [ "$wildcard_mode" -eq 0 ]; then
