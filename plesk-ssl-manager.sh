@@ -287,9 +287,56 @@ check_dns_orphans() {
     printf "\n"
 }
 
+# Helper function to parse domain targets from CLI arguments or --file / -f <filepath>
+parse_target_domains() {
+    target_file=""
+    cli_domains=""
+    
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --file|-f)
+                shift
+                target_file="$1"
+                ;;
+            --force|--wildcard|--dry-run)
+                ;;
+            *)
+                if [ -n "$1" ]; then
+                    cli_domains="$cli_domains $1"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    result_domains=""
+
+    if [ -n "$target_file" ]; then
+        if [ -f "$target_file" ]; then
+            file_domains=$(grep -v '^[[:space:]]*#' "$target_file" 2>/dev/null | grep -v '^[[:space:]]*$' | tr '\r\n' ' ')
+            result_domains="$result_domains $file_domains"
+        else
+            log_error "Domain list file not found: $target_file"
+            exit 1
+        fi
+    fi
+
+    if [ -n "$cli_domains" ]; then
+        result_domains="$result_domains $cli_domains"
+    fi
+
+    echo "$result_domains" | tr ',' ' ' | tr -s ' '
+}
+
 # --- 3. EXPIRY & CERTIFICATE ALERTS ---
 check_alerts() {
-    log_info "Scanning certificates for expiration and security alerts..."
+    target_domains=$(parse_target_domains "$@")
+
+    if [ -n "$target_domains" ]; then
+        log_info "Scanning specific domain(s) for expiration and security alerts: $target_domains"
+    else
+        log_info "Scanning all certificates for expiration and security alerts..."
+    fi
     
     db_data=$(plesk db -N -B -e "
         SELECT d.name, IFNULL(c.name, 'Nessuno'), IFNULL(c.cert_file, 'NULL')
@@ -303,6 +350,19 @@ check_alerts() {
     rm -f "$tmp_alert_file"
 
     echo "$db_data" | while IFS="$tab_char" read -r domain cert_name cert_file; do
+        if [ -n "$target_domains" ]; then
+            matched=0
+            for td in $target_domains; do
+                if [ "$td" = "$domain" ]; then
+                    matched=1
+                    break
+                fi
+            done
+            if [ "$matched" -eq 0 ]; then
+                continue
+            fi
+        fi
+
         if [ "$cert_file" = "NULL" ] || [ -z "$cert_file" ]; then
             echo "⚠️  $domain : NOT PROTECTED (No Certificate)" >> "$tmp_alert_file"
         else
@@ -351,25 +411,24 @@ Run 'plesk-ssl-manager.sh --update' to attempt automatic renewal."
         send_notification "$subject" "$body"
     else
         rm -f "$tmp_alert_file"
-        log_success "All SSL certificates are active and valid for more than $EXPIRY_THRESHOLD_DAYS days."
+        log_success "All checked SSL certificates are active and valid for more than $EXPIRY_THRESHOLD_DAYS days."
     fi
 }
 
 # --- 4. RENEWAL ENGINE ---
 run_update() {
     force_renew=0
-    target_domain=""
     wildcard_mode=0
     renewed_any=0
 
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
+    for arg in "$@"; do
+        case "$arg" in
             --force) force_renew=1 ;;
             --wildcard) wildcard_mode=1 ;;
-            *) target_domain="$1" ;;
         esac
-        shift
     done
+
+    target_domains=$(parse_target_domains "$@")
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log_info "DRY-RUN MODE ACTIVE. No actual changes will be made."
@@ -388,9 +447,9 @@ run_update() {
         log_warn "Could not determine local IP addresses. Skipping DNS checks."
     fi
 
-    if [ -n "$target_domain" ]; then
-        log_info "Processing selective domain: $target_domain"
-        domains="$target_domain"
+    if [ -n "$target_domains" ]; then
+        log_info "Processing selective domain(s): $target_domains"
+        domains="$target_domains"
     else
         log_info "Scanning all domains for smart SSL renewal..."
         domains=$(plesk db -N -B -e "SELECT d.name FROM domains d INNER JOIN hosting h ON d.id = h.dom_id")
@@ -517,7 +576,15 @@ case "$1" in
         check_dns_orphans
         ;;
     --alert|--notify)
-        check_alerts
+        shift
+        args_clean=""
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" != "--dry-run" ]; then
+                args_clean="$args_clean $1"
+            fi
+            shift
+        done
+        check_alerts $args_clean
         ;;
     --update)
         shift
@@ -531,16 +598,18 @@ case "$1" in
         run_update $args_clean
         ;;
     *)
-        echo "Usage: $0 [OPTION]"
+        echo "Usage: $0 [OPTION] [DOMAINS | --file <path>]"
         echo "  (No arguments)              Print visual dashboard with colored certificate statuses."
         echo "  --check-dns                 Identify orphaned or migrated domains resolving elsewhere."
         echo "  --alert, --notify           Scan certificates and send alerts (Email/Webhook) for expiring/expired domains."
+        echo "                              Optionally specify domain(s) or --file <path> to scan specific domains."
         echo "  --update                    Trigger smart renewal (only certificates expiring in < $EXPIRY_THRESHOLD_DAYS days)."
-        echo "  --update <domain>           Renew only the specified domain/subdomain."
-        echo "  --update --force            Force-renew all local domains immediately."
+        echo "                              Optionally specify domain(s) or --file <path> to renew specific domains."
+        echo "  --update --force            Force-renew all or specified local domains immediately."
         echo "  --update --wildcard         Request a wildcard certificate via DNS challenge."
         echo "                              (If external DNS, returns the TXT record to apply)."
-        echo "  --dry-run                   Add to any --update command to simulate execution."
+        echo "  --file, -f <path>           Read target domain list from a text file (one domain per line)."
+        echo "  --dry-run                   Add to any --update or --alert command to simulate execution."
         exit 1
         ;;
 esac
