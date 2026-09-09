@@ -51,6 +51,28 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --- SMART LOGGING & NOTIFICATIONS HELPERS ---
+send_email() {
+    subject="$1"
+    body="$2"
+    [ -z "$NOTIFICATION_EMAIL" ] && return
+    [ "$NOTIFICATION_EMAIL" = "admin@localhost" ] && return
+    [ "$NOTIFICATION_EMAIL" = "sysadmin@tuodominio.com" ] && return
+    [ "$NOTIFICATION_EMAIL" = "sysadmin@yourdomain.com" ] && return
+
+    if command -v mail >/dev/null 2>&1; then
+        printf "%s\n" "$body" | mail -s "$subject" "$NOTIFICATION_EMAIL" >/dev/null 2>&1
+    elif command -v mailx >/dev/null 2>&1; then
+        printf "%s\n" "$body" | mailx -s "$subject" "$NOTIFICATION_EMAIL" >/dev/null 2>&1
+    elif command -v sendmail >/dev/null 2>&1; then
+        (
+            echo "To: $NOTIFICATION_EMAIL"
+            echo "Subject: $subject"
+            echo ""
+            echo "$body"
+        ) | sendmail -t >/dev/null 2>&1
+    fi
+}
+
 send_webhook() {
     [ -z "$WEBHOOK_PROVIDER" ] && return
     message="[SSL MANAGER] $1"
@@ -58,9 +80,17 @@ send_webhook() {
         curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
             -d "chat_id=$TELEGRAM_CHAT_ID" -d "text=$message" >/dev/null 2>&1
     elif [ "$WEBHOOK_PROVIDER" = "slack" ] && [ -n "$SLACK_WEBHOOK_URL" ]; then
-        payload="{\"text\": \"$(echo "$message" | sed 's/"/\\"/g')\"}"
+        slack_text=$(printf "%s" "$message" | sed 's/"/\\"/g' | awk '{if (NR>1) printf "\\n"; printf "%s", $0}')
+        payload="{\"text\": \"$slack_text\"}"
         curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null 2>&1
     fi
+}
+
+send_notification() {
+    subject="$1"
+    message="$2"
+    send_webhook "$message"
+    send_email "$subject" "$message"
 }
 
 log_info() {
@@ -86,7 +116,7 @@ log_skipped() {
 log_error() {
     echo "ERROR: $1" >> "$LOG_FILE"
     printf "${RED}ERROR:${NC} %s\n" "$1"
-    send_webhook "❌ Error: $1"
+    send_notification "[SSL MANAGER ERROR] Error on Plesk Server" "❌ Error: $1"
 }
 
 # Retrieve all configured IPs from Plesk DB
@@ -257,7 +287,75 @@ check_dns_orphans() {
     printf "\n"
 }
 
-# --- 3. RENEWAL ENGINE ---
+# --- 3. EXPIRY & CERTIFICATE ALERTS ---
+check_alerts() {
+    log_info "Scanning certificates for expiration and security alerts..."
+    
+    db_data=$(plesk db -N -B -e "
+        SELECT d.name, IFNULL(c.name, 'Nessuno'), IFNULL(c.cert_file, 'NULL')
+        FROM domains d
+        INNER JOIN hosting h ON d.id = h.dom_id
+        LEFT JOIN certificates c ON h.certificate_id = c.id;
+    ")
+
+    tab_char=$(printf '\t')
+    tmp_alert_file="/tmp/plesk_ssl_alert_$$.tmp"
+    rm -f "$tmp_alert_file"
+
+    echo "$db_data" | while IFS="$tab_char" read -r domain cert_name cert_file; do
+        if [ "$cert_file" = "NULL" ] || [ -z "$cert_file" ]; then
+            echo "⚠️  $domain : NOT PROTECTED (No Certificate)" >> "$tmp_alert_file"
+        else
+            cert_file=$(echo "$cert_file" | tr -d '\r\n ')
+            cert_path="/usr/local/psa/var/certificates/$cert_file"
+            if [ -f "$cert_path" ]; then
+                raw_expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+                if [ -n "$raw_expiry" ]; then
+                    expiry=$(date -u -d "$raw_expiry" +"%Y-%m-%d" 2>/dev/null)
+                    days=$(get_days_diff "$expiry")
+                    
+                    if [ "$days" = "N/D" ]; then
+                        echo "❌ $domain : DATE PARSING ERROR" >> "$tmp_alert_file"
+                    elif [ "$days" -lt 0 ]; then
+                        abs_days=$((days * -1))
+                        echo "❌ $domain : EXPIRED BY $abs_days DAYS (Date: $expiry)" >> "$tmp_alert_file"
+                    elif [ "$days" -le "$EXPIRY_THRESHOLD_DAYS" ]; then
+                        echo "⚠️  $domain : EXPIRING SOON ($days days left - Date: $expiry)" >> "$tmp_alert_file"
+                    fi
+                else
+                    echo "❌ $domain : CERTIFICATE READ ERROR" >> "$tmp_alert_file"
+                fi
+            else
+                echo "❌ $domain : CERTIFICATE FILE NOT FOUND" >> "$tmp_alert_file"
+            fi
+        fi
+    done
+
+    if [ -s "$tmp_alert_file" ]; then
+        alert_count=$(wc -l < "$tmp_alert_file" | tr -d ' ')
+        alert_content=$(cat "$tmp_alert_file")
+        rm -f "$tmp_alert_file"
+        
+        log_warn "Found $alert_count certificate issue(s) requiring attention!"
+        printf "\n=== CERTIFICATE ALERTS REPORT ($alert_count ISSUE(S)) ===\n%s\n\n" "$alert_content"
+        
+        subject="[SSL MANAGER ALERT] $alert_count certificate(s) requiring attention"
+        body="Plesk SSL Manager Alert Report:
+Found $alert_count certificate(s) requiring attention:
+
+$alert_content
+
+Threshold setting: EXPIRY_THRESHOLD_DAYS=$EXPIRY_THRESHOLD_DAYS
+Run 'plesk-ssl-manager.sh --update' to attempt automatic renewal."
+
+        send_notification "$subject" "$body"
+    else
+        rm -f "$tmp_alert_file"
+        log_success "All SSL certificates are active and valid for more than $EXPIRY_THRESHOLD_DAYS days."
+    fi
+}
+
+# --- 4. RENEWAL ENGINE ---
 run_update() {
     force_renew=0
     target_domain=""
@@ -349,7 +447,7 @@ run_update() {
                 log_info "  Host: $txt_host"
                 log_info "  Value: $txt_value"
                 
-                send_webhook "⚠️ DNS TXT Action Required for $domain:\nHost: $txt_host\nValue: $txt_value"
+                send_notification "[SSL MANAGER ACTION REQUIRED] Wildcard TXT for $domain" "⚠️ DNS TXT Action Required for $domain:\nHost: $txt_host\nValue: $txt_value"
                 continue
             elif [ $status -eq 0 ]; then
                 log_success "Wildcard SSL certificate for '$domain' updated successfully (Auto DNS)."
@@ -389,7 +487,7 @@ run_update() {
         if [ $status -eq 0 ]; then
             new_expiry=$(get_cert_expiry "$domain")
             log_success "SSL certificate for '$domain' updated successfully. New expiry: $new_expiry"
-            send_webhook "✅ SSL Renewed: $domain (expires: $new_expiry)"
+            send_notification "[SSL MANAGER RENEWED] $domain" "✅ SSL Renewed: $domain (expires: $new_expiry)"
             renewed_any=1
         else
             log_error "Failed to update SSL certificate for '$domain'.\n\nError details:\n$output"
@@ -418,6 +516,9 @@ case "$1" in
     --check-dns)
         check_dns_orphans
         ;;
+    --alert|--notify)
+        check_alerts
+        ;;
     --update)
         shift
         args_clean=""
@@ -433,6 +534,7 @@ case "$1" in
         echo "Usage: $0 [OPTION]"
         echo "  (No arguments)              Print visual dashboard with colored certificate statuses."
         echo "  --check-dns                 Identify orphaned or migrated domains resolving elsewhere."
+        echo "  --alert, --notify           Scan certificates and send alerts (Email/Webhook) for expiring/expired domains."
         echo "  --update                    Trigger smart renewal (only certificates expiring in < $EXPIRY_THRESHOLD_DAYS days)."
         echo "  --update <domain>           Renew only the specified domain/subdomain."
         echo "  --update --force            Force-renew all local domains immediately."

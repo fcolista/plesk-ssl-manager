@@ -105,19 +105,25 @@ Audit which domains still have hosting configurations on your server but have ch
 /usr/local/bin/plesk-ssl-manager.sh --check-dns
 ```
 
-3. Run Smart Global Renewal
+3. Send Expiration & Security Alerts
+Scan all domains and send instant notifications (via Email and/or Telegram/Slack) for certificates expiring within `EXPIRY_THRESHOLD_DAYS`, expired, or unprotected:
+```
+/usr/local/bin/plesk-ssl-manager.sh --alert
+```
+
+4. Run Smart Global Renewal
 Scans all domains, performs DNS validation, and renews only the certificates expiring in less than 30 days:
 ```
 /usr/local/bin/plesk-ssl-manager.sh --update
 ```
 
-4. Selective Domain Renewal
+5. Selective Domain Renewal
 Renew a specific domain immediately (still checks DNS records first):
 ```
 /usr/local/bin/plesk-ssl-manager.sh --update example.com
 ```
 
-5. Force Renewals
+6. Force Renewals
 Override the 30-day smart check to force an immediate renewal of all domains, or just a single domain:
 
 ```
@@ -125,14 +131,14 @@ Override the 30-day smart check to force an immediate renewal of all domains, or
 /usr/local/bin/plesk-ssl-manager.sh --update example.com --force
 ```
 
-6. Wildcard Issuance
+7. Wildcard Issuance
 Request a Wildcard SSL certificate via DNS Challenge. If external DNS is detected, it returns the required ACME TXT record details (and sends a webhook notification):
 
 ```
 /usr/local/bin/plesk-ssl-manager.sh --update example.com --wildcard
 ```
 
-7. Simulation / Dry-Run Mode
+8. Simulation / Dry-Run Mode
 Simulate execution without issuing actual certificates or reloading web servers:
 
 ```
@@ -141,15 +147,15 @@ Simulate execution without issuing actual certificates or reloading web servers:
 
 ## Automation & Maintenance
 
-1. Setup Weekly Cron Job
-To automate the renewal checking process, add a cron job to run every Monday night at 3:00 AM. Since the script uses smart DNS and expiry checks, this will not trigger rate limits.
+1. Setup Cron Jobs
+To automate both monitoring and renewals, add cron entries via `crontab -e`:
 
+- **Daily Expiry Check & Alerts** (runs every morning at 8:00 AM):
 ```
-crontab -e
+0 8 * * * /usr/local/bin/plesk-ssl-manager.sh --alert >/dev/null 2>&1
 ```
 
-Add the following line:
-
+- **Weekly Smart Renewal** (runs every Monday night at 3:00 AM):
 ```
 0 3 * * 1 /usr/local/bin/plesk-ssl-manager.sh --update >/dev/null 2>&1
 ```
