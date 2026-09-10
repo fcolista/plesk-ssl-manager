@@ -217,9 +217,11 @@ reload_webservers() {
 
 # --- 1. GENERAL REPORT ---
 print_report() {
+    target_domains=$(parse_target_domains "$@")
+
     printf "\n=== PLESK SSL CERTIFICATES STATUS ===\n"
-    printf "%-40s %-30s %-12s %-30s\n" "DOMAIN/SUBDOMAIN" "CERTIFICATE TEMPLATE" "EXPIRY" "STATUS"
-    printf "%s\n" "------------------------------------------------------------------------------------------------------------------------"
+    printf "%-35s %-10s %-30s %-12s %-30s\n" "DOMAIN/SUBDOMAIN" "TYPE" "CERTIFICATE TEMPLATE" "EXPIRY" "STATUS"
+    printf "%s\n" "------------------------------------------------------------------------------------------------------------------------------------"
 
     db_data=$(plesk db -N -B -e "
         SELECT d.name, IFNULL(c.name, 'Nessuno'), IFNULL(c.cert_file, 'NULL')
@@ -231,12 +233,30 @@ print_report() {
     tab_char=$(printf '\t')
 
     echo "$db_data" | while IFS="$tab_char" read -r domain cert_name cert_file; do
+        if [ -n "$target_domains" ]; then
+            matched=0
+            for td in $target_domains; do
+                if [ "$td" = "$domain" ]; then
+                    matched=1
+                    break
+                fi
+            done
+            if [ "$matched" -eq 0 ]; then
+                continue
+            fi
+        fi
+
         if [ "$cert_file" = "NULL" ] || [ -z "$cert_file" ]; then
-            printf "%-40s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "NONE" "N/D" "NOT PROTECTED"
+            printf "%-35s %-10s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "NONE" "NONE" "N/D" "NOT PROTECTED"
         else
             cert_file=$(echo "$cert_file" | tr -d '\r\n ')
             cert_path="/usr/local/psa/var/certificates/$cert_file"
             if [ -f "$cert_path" ]; then
+                cert_type="STANDARD"
+                if openssl x509 -noout -text -in "$cert_path" 2>/dev/null | grep -q "DNS:\*\."; then
+                    cert_type="WILDCARD"
+                fi
+
                 raw_expiry=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
                 if [ -n "$raw_expiry" ]; then
                     expiry=$(date -u -d "$raw_expiry" +"%Y-%m-%d" 2>/dev/null)
@@ -244,23 +264,23 @@ print_report() {
                     
                     if [ "$days" = "N/D" ]; then
                         status_str="DATE PARSING ERROR"
-                        printf "%-40s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_name" "$expiry" "$status_str"
+                        printf "%-35s %-10s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_type" "$cert_name" "$expiry" "$status_str"
                     elif [ "$days" -lt 0 ]; then
                         abs_days=$((days * -1))
                         status_str="EXPIRED BY $abs_days DAYS"
-                        printf "%-40s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_name" "$expiry" "$status_str"
+                        printf "%-35s %-10s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_type" "$cert_name" "$expiry" "$status_str"
                     elif [ "$days" -le "$EXPIRY_THRESHOLD_DAYS" ]; then
                         status_str="EXPIRING SOON ($days DAYS LEFT)"
-                        printf "%-40s %-30s %-12s ${YELLOW}%-30s${NC}\n" "$domain" "$cert_name" "$expiry" "$status_str"
+                        printf "%-35s %-10s %-30s %-12s ${YELLOW}%-30s${NC}\n" "$domain" "$cert_type" "$cert_name" "$expiry" "$status_str"
                     else
                         status_str="ACTIVE ($days DAYS LEFT)"
-                        printf "%-40s %-30s %-12s ${GREEN}%-30s${NC}\n" "$domain" "$cert_name" "$expiry" "$status_str"
+                        printf "%-35s %-10s %-30s %-12s ${GREEN}%-30s${NC}\n" "$domain" "$cert_type" "$cert_name" "$expiry" "$status_str"
                     fi
                 else
-                    printf "%-40s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_name" "N/D" "CERTIFICATE READ ERROR"
+                    printf "%-35s %-10s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_type" "$cert_name" "N/D" "CERTIFICATE READ ERROR"
                 fi
             else
-                printf "%-40s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "$cert_name" "N/D" "CERTIFICATE FILE NOT FOUND"
+                printf "%-35s %-10s %-30s %-12s ${RED}%-30s${NC}\n" "$domain" "UNKNOWN" "$cert_name" "N/D" "CERTIFICATE FILE NOT FOUND"
             fi
         fi
     done
@@ -572,6 +592,17 @@ case "$1" in
     "")
         print_report
         ;;
+    --check)
+        shift
+        args_clean=""
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" != "--dry-run" ]; then
+                args_clean="$args_clean $1"
+            fi
+            shift
+        done
+        print_report $args_clean
+        ;;
     --check-dns)
         check_dns_orphans
         ;;
@@ -599,7 +630,8 @@ case "$1" in
         ;;
     *)
         echo "Usage: $0 [OPTION] [DOMAINS | --file <path>]"
-        echo "  (No arguments)              Print visual dashboard with colored certificate statuses."
+        echo "  (No arguments)              Print visual dashboard with colored certificate statuses & types."
+        echo "  --check                     Display certificate status dashboard (WILDCARD/STANDARD) for all or specific domains."
         echo "  --check-dns                 Identify orphaned or migrated domains resolving elsewhere."
         echo "  --alert, --notify           Scan certificates and send alerts (Email/Webhook) for expiring/expired domains."
         echo "                              Optionally specify domain(s) or --file <path> to scan specific domains."

@@ -92,11 +92,14 @@ SLACK_WEBHOOK_URL=""
 
 ## Usage Guide
 
-1. Show Colored Certificate Status (Default)
-Run the script with no arguments to print a complete, color-coded status table of your hosted domains:
+1. Show Colored Certificate Status (Default or `--check`)
+Run the script with no arguments (or with `--check`) to print a complete, color-coded status table showing certificate types (`WILDCARD` or `STANDARD`) and expiration status:
 
 ```
 /usr/local/bin/plesk-ssl-manager.sh
+/usr/local/bin/plesk-ssl-manager.sh --check
+/usr/local/bin/plesk-ssl-manager.sh --check example.com
+/usr/local/bin/plesk-ssl-manager.sh --check --file /etc/plesk_domains.txt
 ```
 
 2. Identify Orphaned and Migrated Domains
