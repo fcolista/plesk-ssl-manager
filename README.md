@@ -130,7 +130,14 @@ Renew specific domains immediately (still checks DNS records first):
 /usr/local/bin/plesk-ssl-manager.sh --update --file /etc/plesk_domains.txt
 ```
 
-6. Target Domain List File Format (`/etc/plesk_domains.txt`)
+6. Custom Subdomains & Plesk Mail SSL/TLS Binding
+Add custom subdomains (e.g. `mail`, `smtp`, `imap`, `pop3s`) to standard certificates and automatically bind the resulting certificate to **Plesk Mail & Webmail SSL/TLS** settings:
+```
+/usr/local/bin/plesk-ssl-manager.sh --update example.com --subdomains mail,smtp,imap --force
+/usr/local/bin/plesk-ssl-manager.sh --update example.com --secure-mail --force
+```
+
+7. Target Domain List File Format (`/etc/plesk_domains.txt`)
 Create a simple text file with one domain per line. Empty lines and comments (starting with `#`) are ignored:
 ```text
 # Domain list for selective monitoring/renewal
@@ -139,7 +146,7 @@ domain2.com
 sub.domain3.com
 ```
 
-7. Force Renewals
+8. Force Renewals
 Override the 30-day smart check to force an immediate renewal of all domains, or just specified domains:
 
 ```
@@ -148,14 +155,14 @@ Override the 30-day smart check to force an immediate renewal of all domains, or
 /usr/local/bin/plesk-ssl-manager.sh --update --file /etc/plesk_domains.txt --force
 ```
 
-8. Wildcard Issuance
+9. Wildcard Issuance
 Request a Wildcard SSL certificate via DNS Challenge. If external DNS is detected, it returns the required ACME TXT record details (and sends a webhook notification):
 
 ```
 /usr/local/bin/plesk-ssl-manager.sh --update example.com --wildcard
 ```
 
-9. Simulation / Dry-Run Mode
+10. Simulation / Dry-Run Mode
 Simulate execution without issuing actual certificates or reloading web servers:
 
 ```

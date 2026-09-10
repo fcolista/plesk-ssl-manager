@@ -318,7 +318,10 @@ parse_target_domains() {
                 shift
                 target_file="$1"
                 ;;
-            --force|--wildcard|--dry-run)
+            --subdomains|-s)
+                shift
+                ;;
+            --force|--wildcard|--secure-mail|--dry-run)
                 ;;
             *)
                 if [ -n "$1" ]; then
@@ -435,16 +438,27 @@ Run 'plesk-ssl-manager.sh --update' to attempt automatic renewal."
     fi
 }
 
-# --- 4. RENEWAL ENGINE ---
+## --- 4. RENEWAL ENGINE ---
 run_update() {
     force_renew=0
     wildcard_mode=0
+    secure_mail=0
+    custom_subdomains=""
     renewed_any=0
 
+    # Parse command flags
+    arg_is_sub=0
     for arg in "$@"; do
+        if [ "$arg_is_sub" -eq 1 ]; then
+            custom_subdomains="$arg"
+            arg_is_sub=0
+            continue
+        fi
         case "$arg" in
             --force) force_renew=1 ;;
             --wildcard) wildcard_mode=1 ;;
+            --secure-mail) secure_mail=1 ;;
+            --subdomains|-s) arg_is_sub=1 ;;
         esac
     done
 
@@ -489,7 +503,7 @@ run_update() {
         fi
 
         # --- SMART EXPIRY CHECK ---
-        if [ "$force_renew" -eq 0 ] && [ -z "$target_domain" ]; then
+        if [ "$force_renew" -eq 0 ] && [ -z "$target_domains" ]; then
             expiry=$(get_cert_expiry "$domain")
             if [ "$expiry" != "N/D" ]; then
                 days_left=$(get_days_diff "$expiry")
@@ -530,6 +544,21 @@ run_update() {
                 continue
             elif [ $status -eq 0 ]; then
                 log_success "Wildcard SSL certificate for '$domain' updated successfully (Auto DNS)."
+                
+                if [ "$secure_mail" -eq 1 ]; then
+                    cert_name=$(plesk db -N -B -e "
+                        SELECT c.name 
+                        FROM domains d 
+                        JOIN hosting h ON d.id = h.dom_id 
+                        JOIN certificates c ON h.certificate_id = c.id 
+                        WHERE d.name='$domain'
+                    " 2>/dev/null | tr -d '\r\n')
+                    if [ -n "$cert_name" ] && [ "$cert_name" != "NULL" ]; then
+                        plesk bin mail -u "$domain" -mail-certificate "$cert_name" >/dev/null 2>&1
+                        plesk bin mail -u "$domain" -webmail-certificate "$cert_name" >/dev/null 2>&1
+                        log_success "Plesk Mail & Webmail SSL/TLS enabled with Wildcard certificate ('$cert_name')."
+                    fi
+                fi
                 renewed_any=1
             else
                 log_error "Failed to update Wildcard SSL certificate for '$domain'. Details:\n$output"
@@ -546,6 +575,7 @@ run_update() {
             domains_arg="$domains_arg -d www.$domain"
         fi
 
+        # Add aliases
         for alias in $alias_list; do
             if [ -n "$local_ips" ]; then
                 alias_ip=$(resolve_dns "$alias")
@@ -558,6 +588,45 @@ run_update() {
                 domains_arg="$domains_arg -d $alias -d www.$alias"
             fi
         done
+
+        # --- PROCESS CUSTOM SUBDOMAINS ---
+        has_mail_subdomain=0
+        if [ -n "$custom_subdomains" ]; then
+            sub_clean=$(echo "$custom_subdomains" | tr ',' ' ')
+            for sub in $sub_clean; do
+                case "$sub" in
+                    *."$domain"|*."$domain."*)
+                        full_sub="$sub"
+                        ;;
+                    *.*)
+                        full_sub="$sub"
+                        ;;
+                    *)
+                        full_sub="$sub.$domain"
+                        ;;
+                esac
+
+                # Check if subdomain is mail-related
+                case "$sub" in
+                    *mail*|*smtp*|*imap*|*pop*)
+                        has_mail_subdomain=1
+                        ;;
+                esac
+
+                if [ -n "$local_ips" ]; then
+                    sub_ip=$(resolve_dns "$full_sub")
+                    if is_local_ip "$sub_ip" "$local_ips"; then
+                        domains_arg="$domains_arg -d $full_sub"
+                        log_info "  -> Added custom subdomain: $full_sub"
+                    else
+                        log_warn "  -> Custom subdomain '$full_sub' excluded (points to external IP $sub_ip or DNS missing)"
+                    fi
+                else
+                    domains_arg="$domains_arg -d $full_sub"
+                    log_info "  -> Added custom subdomain: $full_sub"
+                fi
+            done
+        fi
         
         cmd="plesk bin extension --exec letsencrypt cli.php -m \"$REGISTRATION_EMAIL\" $domains_arg --expand"
         output=$(eval "$cmd" 2>&1)
@@ -566,6 +635,29 @@ run_update() {
         if [ $status -eq 0 ]; then
             new_expiry=$(get_cert_expiry "$domain")
             log_success "SSL certificate for '$domain' updated successfully. New expiry: $new_expiry"
+            
+            # --- ASSIGN CERTIFICATE TO PLESK MAIL & WEBMAIL IF REQUESTED OR MAIL SUBDOMAIN ADDED ---
+            if [ "$secure_mail" -eq 1 ] || [ "$has_mail_subdomain" -eq 1 ]; then
+                cert_name=$(plesk db -N -B -e "
+                    SELECT c.name 
+                    FROM domains d 
+                    JOIN hosting h ON d.id = h.dom_id 
+                    JOIN certificates c ON h.certificate_id = c.id 
+                    WHERE d.name='$domain'
+                " 2>/dev/null | tr -d '\r\n')
+                
+                if [ -n "$cert_name" ] && [ "$cert_name" != "NULL" ]; then
+                    log_info "Assigning SSL certificate '$cert_name' to Plesk Mail service for '$domain'..."
+                    plesk bin mail -u "$domain" -mail-certificate "$cert_name" >/dev/null 2>&1 || \
+                    plesk ext sslit --certificate -secure-mail -domain "$domain" >/dev/null 2>&1
+
+                    plesk bin mail -u "$domain" -webmail-certificate "$cert_name" >/dev/null 2>&1 || \
+                    plesk ext sslit --certificate -secure-webmail -domain "$domain" >/dev/null 2>&1
+
+                    log_success "Plesk Mail & Webmail SSL/TLS certificate enabled ('$cert_name')."
+                fi
+            fi
+
             send_notification "[SSL MANAGER RENEWED] $domain" "✅ SSL Renewed: $domain (expires: $new_expiry)"
             renewed_any=1
         else
@@ -640,6 +732,8 @@ case "$1" in
         echo "  --update --force            Force-renew all or specified local domains immediately."
         echo "  --update --wildcard         Request a wildcard certificate via DNS challenge."
         echo "                              (If external DNS, returns the TXT record to apply)."
+        echo "  --subdomains, -s <list>     Add custom subdomains (comma-separated, e.g. mail,smtp,imap)."
+        echo "  --secure-mail               Automatically enable SSL/TLS certificate for Plesk Mail & Webmail."
         echo "  --file, -f <path>           Read target domain list from a text file (one domain per line)."
         echo "  --dry-run                   Add to any --update or --alert command to simulate execution."
         exit 1
